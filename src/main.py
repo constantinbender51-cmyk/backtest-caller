@@ -146,5 +146,17 @@ async def health_check():
     return {"status": "healthy", "timestamp": time.time()}
 
 if __name__ == "__main__":
+    import os
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+    # Get port from Railway environment variable or default to 8000
+    port = int(os.environ.get("PORT", 8000))
+    
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        # Optional: add these for better performance in production
+        workers=int(os.environ.get("WEB_CONCURRENCY", 1)),
+        timeout_keep_alive=60
+    )
