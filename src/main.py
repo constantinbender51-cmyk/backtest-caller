@@ -20,70 +20,106 @@ class BacktestCaller:
         try:
             async with session.get(self.base_url, timeout=30) as response:
                 if response.status == 200:
-                    return await response.json()
+                    data = await response.json()
+                    return data
                 return {"error": f"HTTP {response.status}"}
         except Exception as e:
             return {"error": str(e)}
     
     async def call_multiple_times(self, num_calls: int = 200) -> dict:
-        """Call the backtest service multiple times"""
+        """Call the backtest service multiple times with concurrency"""
         results = []
         successful_calls = 0
+        pnl_data = []
         
-        logger.info(f"Starting {num_calls} calls")
+        logger.info(f"Starting {num_calls} calls to backtest service")
         start_time = time.time()
         
-        # Use connection pooling with limits
-        connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)
+        # Use connection pooling with reasonable limits
+        connector = aiohttp.TCPConnector(limit=20, limit_per_host=10)
         async with aiohttp.ClientSession(connector=connector) as session:
-            tasks = []
-            for i in range(num_calls):
-                task = self.call_backtest_service(session)
-                tasks.append(task)
+            # Process in batches to avoid overwhelming the API
+            batch_size = 50
+            for batch_start in range(0, num_calls, batch_size):
+                batch_end = min(batch_start + batch_size, num_calls)
+                batch_tasks = []
                 
-                # Process in smaller batches to avoid timeouts
-                if len(tasks) >= 50 or i == num_calls - 1:
-                    batch_results = await asyncio.gather(*tasks)
-                    results.extend(batch_results)
-                    tasks = []
-                    
-                    # Log progress
-                    logger.info(f"Progress: {len(results)}/{num_calls} calls completed")
-                    
-                    # Small delay between batches
-                    await asyncio.sleep(0.1)
+                for i in range(batch_start, batch_end):
+                    batch_tasks.append(self.call_backtest_service(session))
+                
+                batch_results = await asyncio.gather(*batch_tasks)
+                results.extend(batch_results)
+                
+                # Count successful calls and extract PNL
+                for result in batch_results:
+                    if isinstance(result, dict) and "error" not in result:
+                        successful_calls += 1
+                        if "evaluation" in result and result["evaluation"].get("pnl_percent") is not None:
+                            pnl_data.append(result["evaluation"]["pnl_percent"])
+                
+                # Log progress
+                progress = len(results)
+                logger.info(f"Progress: {progress}/{num_calls} calls completed")
+                
+                # Small delay between batches to be gentle on the API
+                if progress < num_calls:
+                    await asyncio.sleep(0.5)
         
         end_time = time.time()
+        execution_time = end_time - start_time
         
-        # Count successful calls
-        successful_calls = sum(1 for r in results if "error" not in r)
+        # Calculate profitability metrics
+        total_pnl = sum(pnl_data) if pnl_data else 0
+        avg_pnl = total_pnl / len(pnl_data) if pnl_data else 0
         
-        logger.info(f"Completed {successful_calls}/{num_calls} successful calls in {end_time - start_time:.2f}s")
+        logger.info(f"Completed {successful_calls}/{num_calls} calls in {execution_time:.2f}s")
         
         return {
-            "total_calls": num_calls,
-            "successful_calls": successful_calls,
-            "failed_calls": num_calls - successful_calls,
-            "execution_time": round(end_time - start_time, 2),
-            "sample_result": results[0] if results else "No results"
+            "summary": {
+                "total_calls": num_calls,
+                "successful_calls": successful_calls,
+                "failed_calls": num_calls - successful_calls,
+                "success_rate": round((successful_calls / num_calls) * 100, 2) if num_calls > 0 else 0,
+                "execution_time_seconds": round(execution_time, 2),
+                "calls_per_second": round(num_calls / execution_time, 2) if execution_time > 0 else 0
+            },
+            "profitability_analysis": {
+                "total_pnl_percent": round(total_pnl, 4),
+                "average_pnl_percent": round(avg_pnl, 4),
+                "total_trades_analyzed": len(pnl_data),
+                "final_score": self.calculate_score(avg_pnl, successful_calls, num_calls)
+            }
         }
+    
+    def calculate_score(self, avg_pnl: float, successful: int, total: int) -> float:
+        """Calculate a simple profitability score"""
+        success_rate = (successful / total) * 100 if total > 0 else 0
+        score = (success_rate * 0.5) + (avg_pnl * 10 * 0.5)
+        return round(min(100, max(0, score)), 2)
 
 backtest_caller = BacktestCaller()
 
 @app.get("/")
 async def root():
-    return {"message": "Backtest Caller Service - Use /run-backtest to start analysis"}
+    return {"message": "Backtest Caller Service - Use /run-backtest?calls=1000 to start analysis"}
 
 @app.get("/run-backtest")
 async def run_backtest(calls: int = 200):
-    """Run the backtest analysis"""
+    """Run the backtest analysis with specified number of calls"""
     try:
-        logger.info(f"Starting backtest with {calls} calls")
+        logger.info(f"Received request for {calls} calls")
+        
+        if calls > 1000:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Maximum 1000 calls allowed"}
+            )
+        
         results = await backtest_caller.call_multiple_times(calls)
         return results
         
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
+        logger.error(f"Error running backtest: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 @app.get("/health")
@@ -92,15 +128,13 @@ async def health_check():
 
 @app.get("/test")
 async def test_endpoint():
-    """Simple test endpoint"""
-    return {"message": "Test successful", "status": "working"}
+    """Test endpoint to verify service is working"""
+    return {"message": "Service is working", "status": "ok"}
 
+# For Railway deployment
 if __name__ == "__main__":
     import os
     import uvicorn
     
-    # Railway uses port 8080 by default
     port = int(os.environ.get("PORT", 8080))
-    print(f"Starting server on port {port}")
-    
     uvicorn.run(app, host="0.0.0.0", port=port)
