@@ -182,3 +182,16 @@ async def shutdown_event():
 async def test_endpoint():
     """Simple test endpoint to verify the app is running"""
     return {"message": "Test successful", "status": "working"}
+
+if __name__ == "__main__":
+    import os
+    import uvicorn
+    
+    # Get port from environment variable or default to 8000
+    port = int(os.environ.get("PORT", 8000))
+    
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port
+    )
