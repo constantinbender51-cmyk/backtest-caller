@@ -2,6 +2,7 @@ import asyncio
 import aiohttp
 import json
 import time
+import os
 from typing import List, Dict, Any
 import pandas as pd
 import numpy as np
@@ -145,18 +146,4 @@ async def run_backtest(calls: int = 200):
 async def health_check():
     return {"status": "healthy", "timestamp": time.time()}
 
-if __name__ == "__main__":
-    import os
-    import uvicorn
-    
-    # Get port from Railway environment variable or default to 8000
-    port = int(os.environ.get("PORT", 8000))
-    
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=port,
-        # Optional: add these for better performance in production
-        workers=int(os.environ.get("WEB_CONCURRENCY", 1)),
-        timeout_keep_alive=60
-    )
+# Remove the if __name__ block since Railway will use the Procfile command
