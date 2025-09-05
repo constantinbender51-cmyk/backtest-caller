@@ -2,6 +2,7 @@ import asyncio
 import aiohttp
 import time
 import logging
+import random
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -17,38 +18,53 @@ class BacktestCaller:
     def __init__(self):
         self.base_url = "https://btc-signal-generator-production.up.railway.app/signal/next"
         
-    async def call_backtest_service(self, session: aiohttp.ClientSession) -> dict:
-        """Call the backtest service once"""
-        try:
-            async with session.get(self.base_url, timeout=30) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data
-                return {"error": f"HTTP {response.status}"}
-        except asyncio.TimeoutError:
-            return {"error": "Timeout"}
-        except Exception as e:
-            return {"error": str(e)}
+    async def call_backtest_service(self, session: aiohttp.ClientSession, max_retries: int = 3) -> dict:
+        """Call the backtest service with retries"""
+        for attempt in range(max_retries):
+            try:
+                async with session.get(self.base_url, timeout=15) as response:  # Reduced timeout
+                    if response.status == 200:
+                        data = await response.json()
+                        return data
+                    elif response.status == 429:  # Rate limited
+                        wait_time = (attempt + 1) * 2  # Exponential backoff
+                        logger.warning(f"Rate limited, waiting {wait_time}s (attempt {attempt + 1})")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        return {"error": f"HTTP {response.status}"}
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout on attempt {attempt + 1}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)  # Wait before retry
+                continue
+            except Exception as e:
+                logger.warning(f"Error on attempt {attempt + 1}: {str(e)}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                continue
+        
+        return {"error": "All retries failed"}
     
     async def call_multiple_times(self, num_calls: int = 200) -> dict:
-        """Call the backtest service multiple times with concurrency"""
+        """Call the backtest service with careful pacing"""
         results = []
         successful_calls = 0
         
         logger.info(f"Starting {num_calls} calls to backtest service")
         start_time = time.time()
         
-        # Use connection pooling with reasonable limits
-        connector = aiohttp.TCPConnector(limit=20, limit_per_host=10)
+        # Use very conservative connection limits
+        connector = aiohttp.TCPConnector(limit=5, limit_per_host=3)  # Reduced from 20/10
         async with aiohttp.ClientSession(connector=connector) as session:
-            # Process in batches to avoid overwhelming the API
-            batch_size = 50
+            # Process in much smaller batches with longer delays
+            batch_size = 10  # Reduced from 50
             for batch_start in range(0, num_calls, batch_size):
                 batch_end = min(batch_start + batch_size, num_calls)
                 batch_tasks = []
                 
                 for i in range(batch_start, batch_end):
-                    batch_tasks.append(self.call_backtest_service(session))
+                    batch_tasks.append(self.call_backtest_service(session, max_retries=2))  # Reduced retries
                 
                 batch_results = await asyncio.gather(*batch_tasks)
                 results.extend(batch_results)
@@ -59,11 +75,13 @@ class BacktestCaller:
                 
                 # Log progress
                 progress = len(results)
-                logger.info(f"Progress: {progress}/{num_calls} calls completed ({successful_in_batch} successful in batch)")
+                logger.info(f"Progress: {progress}/{num_calls} calls ({successful_in_batch}/10 successful in batch)")
                 
-                # Small delay between batches to be gentle on the API
+                # Longer delay between batches with jitter
                 if progress < num_calls:
-                    await asyncio.sleep(0.5)
+                    delay = random.uniform(2.0, 4.0)  # 2-4 second delay between batches
+                    logger.info(f"Waiting {delay:.1f}s before next batch...")
+                    await asyncio.sleep(delay)
         
         end_time = time.time()
         execution_time = end_time - start_time
@@ -128,22 +146,20 @@ class BacktestCaller:
                 "sharpe_ratio": round(sharpe_ratio, 4),
                 "final_score": self.calculate_final_score(win_rate, avg_pnl, sharpe_ratio)
             },
-            "failed_calls_sample": failed_results[:5] if failed_results else "No failed calls"
+            "failed_calls_sample": failed_results[:5] if failed_results else "No failed calls",
+            "recommendation": "Consider running fewer calls with slower pacing for better success rate" if len(failed_results) > total_calls * 0.3 else "Good success rate"
         }
     
     def calculate_final_score(self, win_rate: float, avg_pnl: float, sharpe_ratio: float) -> float:
         """Calculate a final profitability score (0-100)"""
         try:
-            # Weighted scoring system
-            win_rate_score = min(win_rate, 100)  # Max 100 points for win rate
-            pnl_score = avg_pnl * 10  # Scale PNL appropriately
-            sharpe_score = sharpe_ratio * 20  # Scale Sharpe ratio
+            win_rate_score = min(win_rate, 100)
+            pnl_score = avg_pnl * 10
+            sharpe_score = sharpe_ratio * 20
             
-            # Apply weights
             total_score = (win_rate_score * 0.4) + (pnl_score * 0.4) + (sharpe_score * 0.2)
             
-            # Normalize to 0-100 scale
-            return max(0, min(100, total_score))
+            return max(0, min(100, round(total_score, 2)))
         except Exception:
             return 0
 
@@ -151,7 +167,7 @@ backtest_caller = BacktestCaller()
 
 @app.get("/")
 async def root():
-    return {"message": "Backtest Caller Service - Use /run-backtest to start analysis"}
+    return {"message": "Backtest Caller Service - Use /run-backtest?calls=200 for better success rate"}
 
 @app.get("/run-backtest")
 async def run_backtest(calls: int = 200):
@@ -159,10 +175,10 @@ async def run_backtest(calls: int = 200):
     try:
         logger.info(f"Received request for {calls} calls")
         
-        if calls > 1000:
+        if calls > 500:  # Reduced from 1000
             return JSONResponse(
                 status_code=400,
-                content={"error": "Maximum 1000 calls allowed to prevent overload"}
+                content={"error": "Maximum 500 calls allowed to avoid overwhelming the service"}
             )
         
         results = await backtest_caller.call_multiple_times(calls)
@@ -176,10 +192,14 @@ async def run_backtest(calls: int = 200):
 async def health_check():
     return {"status": "healthy", "timestamp": time.time()}
 
-@app.get("/test")
-async def test_endpoint():
-    """Test endpoint to verify service is working"""
-    return {"message": "Service is working", "status": "ok"}
+@app.get("/test-small")
+async def test_small():
+    """Test with a small number of calls"""
+    try:
+        results = await backtest_caller.call_multiple_times(10)
+        return results
+    except Exception as e:
+        return {"error": str(e)}
 
 # For Railway deployment
 if __name__ == "__main__":
