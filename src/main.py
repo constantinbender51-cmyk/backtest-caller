@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from async_timeout import timeout
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -22,9 +23,10 @@ class BacktestCaller:
         self.results = []
         self.total_calls = 0
         self.successful_calls = 0
+        self.semaphore = None
         
     async def call_backtest_service(self, session: aiohttp.ClientSession) -> Dict[str, Any]:
-        """Call the backtest service once"""
+        """Call the backtest service once with timeout"""
         try:
             async with session.get(self.base_url, timeout=30) as response:
                 if response.status == 200:
@@ -41,34 +43,65 @@ class BacktestCaller:
             logger.error(f"Error calling backtest service: {str(e)}")
             return {"error": str(e)}
     
-    async def call_multiple_times(self, num_calls: int = 200) -> Dict[str, Any]:
-        """Call the backtest service multiple times asynchronously"""
+    async def bounded_call(self, session: aiohttp.ClientSession):
+        """Make call with semaphore for rate limiting"""
+        async with self.semaphore:
+            return await self.call_backtest_service(session)
+    
+    async def call_multiple_times(self, num_calls: int = 200, concurrency: int = 20) -> Dict[str, Any]:
+        """Call the backtest service multiple times with concurrency control"""
         self.results = []
         self.total_calls = num_calls
         self.successful_calls = 0
         
-        logger.info(f"Starting {num_calls} calls to backtest service")
+        # Limit concurrent requests to avoid overwhelming the server
+        self.semaphore = asyncio.Semaphore(concurrency)
+        
+        logger.info(f"Starting {num_calls} calls with {concurrency} concurrent requests")
         start_time = time.time()
         
         try:
-            async with aiohttp.ClientSession() as session:
-                tasks = [self.call_backtest_service(session) for _ in range(num_calls)]
-                results = await asyncio.gather(*tasks)
-                self.results = results
+            connector = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                tasks = [self.bounded_call(session) for _ in range(num_calls)]
+                
+                # Process in chunks to avoid memory issues with large numbers
+                chunk_size = 100
+                for i in range(0, num_calls, chunk_size):
+                    chunk_tasks = tasks[i:i + chunk_size]
+                    chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
+                    self.results.extend(chunk_results)
+                    
+                    # Log progress
+                    progress = min(i + chunk_size, num_calls)
+                    logger.info(f"Progress: {progress}/{num_calls} calls completed")
+                    
+                    # Small delay between chunks to be gentle on the API
+                    if i + chunk_size < num_calls:
+                        await asyncio.sleep(1)
+        
         except Exception as e:
             logger.error(f"Error in call_multiple_times: {str(e)}")
             raise
         
         end_time = time.time()
-        logger.info(f"Completed {num_calls} calls in {end_time - start_time:.2f} seconds")
+        total_time = end_time - start_time
+        logger.info(f"Completed {num_calls} calls in {total_time:.2f} seconds ({num_calls/total_time:.2f} calls/sec)")
         
-        return self.analyze_results(end_time - start_time)
+        return self.analyze_results(total_time)
     
     def analyze_results(self, execution_time: float) -> Dict[str, Any]:
         """Analyze the results and calculate profitability metrics"""
         try:
-            successful_results = [r for r in self.results if "error" not in r]
-            failed_results = [r for r in self.results if "error" in r]
+            successful_results = [r for r in self.results if isinstance(r, dict) and "error" not in r]
+            failed_results = [r for r in self.results if not isinstance(r, dict) or "error" in r]
+            
+            # Log failure reasons
+            for result in failed_results:
+                if isinstance(result, Exception):
+                    logger.warning(f"Call failed with exception: {str(result)}")
+                elif isinstance(result, dict) and "error" in result:
+                    logger.warning(f"Call failed: {result['error']}")
             
             # Extract PNL data from successful calls
             pnl_data = []
@@ -108,7 +141,8 @@ class BacktestCaller:
                     "failed_calls": len(failed_results),
                     "success_rate": (self.successful_calls / self.total_calls * 100) if self.total_calls > 0 else 0,
                     "execution_time_seconds": round(execution_time, 2),
-                    "calls_per_second": round(self.total_calls / execution_time, 2) if execution_time > 0 else 0
+                    "calls_per_second": round(self.total_calls / execution_time, 2) if execution_time > 0 else 0,
+                    "concurrent_requests": 20
                 },
                 "profitability_analysis": {
                     "total_pnl_percent": round(total_pnl, 4),
@@ -121,7 +155,7 @@ class BacktestCaller:
                     "sharpe_ratio": round(sharpe_ratio, 4),
                     "final_score": self.calculate_final_score(win_rate, avg_pnl, sharpe_ratio)
                 },
-                "failed_calls_sample": failed_results[:5] if failed_results else "No failed calls"
+                "failed_calls_sample": failed_results[:10] if failed_results else "No failed calls"
             }
         except Exception as e:
             logger.error(f"Error in analyze_results: {str(e)}")
@@ -148,20 +182,35 @@ async def root():
     return {"message": "Backtest Caller Service - Use /run-backtest to start analysis"}
 
 @app.get("/run-backtest")
-async def run_backtest(calls: int = 200):
-    """Run the backtest analysis with specified number of calls"""
+async def run_backtest(calls: int = 200, concurrency: int = 20):
+    """Run the backtest analysis with specified number of calls and concurrency"""
     try:
-        logger.info(f"Received request for {calls} calls")
+        logger.info(f"Received request for {calls} calls with {concurrency} concurrency")
         
-        if calls > 1000:
+        if calls > 2000:
             return JSONResponse(
                 status_code=400,
-                content={"error": "Maximum 1000 calls allowed to prevent overload"}
+                content={"error": "Maximum 2000 calls allowed to prevent overload"}
             )
         
-        results = await backtest_caller.call_multiple_times(calls)
+        if concurrency > 50:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Maximum 50 concurrent requests allowed"}
+            )
+        
+        # Set appropriate timeout based on call volume
+        timeout_seconds = min(600, 60 + (calls * 0.5))  # Max 10 minutes
+        
+        results = await asyncio.wait_for(
+            backtest_caller.call_multiple_times(calls, concurrency),
+            timeout=timeout_seconds
+        )
         return results
         
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout after {timeout_seconds} seconds for {calls} calls")
+        raise HTTPException(status_code=504, detail=f"Request timed out after {timeout_seconds} seconds")
     except Exception as e:
         logger.error(f"Error in run_backtest endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error running backtest: {str(e)}")
@@ -170,28 +219,7 @@ async def run_backtest(calls: int = 200):
 async def health_check():
     return {"status": "healthy", "timestamp": time.time()}
 
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Application starting up")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("Application shutting down")
-
 @app.get("/test")
 async def test_endpoint():
-    """Simple test endpoint to verify the app is running"""
+    """Simple test endpoint"""
     return {"message": "Test successful", "status": "working"}
-
-if __name__ == "__main__":
-    import os
-    import uvicorn
-    
-    # Get port from environment variable or default to 8000
-    port = int(os.environ.get("PORT", 8000))
-    
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=port
-    )
