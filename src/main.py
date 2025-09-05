@@ -95,7 +95,12 @@ async def test_endpoint():
     """Simple test endpoint"""
     return {"message": "Test successful", "status": "working"}
 
-# For local testing
 if __name__ == "__main__":
+    import os
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+    # Railway uses port 8080 by default
+    port = int(os.environ.get("PORT", 8080))
+    print(f"Starting server on port {port}")
+    
+    uvicorn.run(app, host="0.0.0.0", port=port)
