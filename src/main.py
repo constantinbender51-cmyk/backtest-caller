@@ -52,7 +52,16 @@ class BacktestCaller:
         
         try:
             async with aiohttp.ClientSession() as session:
-                tasks = [self.call_backtest_service(session) for _ in range(num_calls)]
+                tasks = []
+                for i in range(num_calls):
+                    # Add task to call the service
+                    tasks.append(self.call_backtest_service(session))
+                    
+                    # Add 1 second delay every 50 calls
+                    if (i + 1) % 50 == 0 and i < num_calls - 1:
+                        logger.info(f"Added delay after {i + 1} calls")
+                        await asyncio.sleep(1)
+                
                 results = await asyncio.gather(*tasks)
                 self.results = results
         except Exception as e:
