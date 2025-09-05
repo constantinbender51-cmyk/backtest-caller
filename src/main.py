@@ -177,3 +177,8 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("Application shutting down")
+
+@app.get("/test")
+async def test_endpoint():
+    """Simple test endpoint to verify the app is running"""
+    return {"message": "Test successful", "status": "working"}
